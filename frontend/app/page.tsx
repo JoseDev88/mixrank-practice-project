@@ -43,6 +43,21 @@ export default function Page() {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [edit, setEdit] = useState<Partial<AppItem>>({});
 
+  // auth state (admin token stored in localStorage)
+  const [token, setToken] = useState<string>('');
+  const authed = Boolean(token);
+
+  useEffect(() => {
+    const saved = typeof window !== 'undefined' ? localStorage.getItem('admintoken') : '';
+    if (saved) setToken(saved);
+  }, []);
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      if (token) localStorage.setItem('admintoken', token);
+      else localStorage.removeItem('admintoken');
+    }
+  }, [token]);
+
   function fetchPage() {
     const params = new URLSearchParams();
     if (q) params.set('q', q);
@@ -79,7 +94,10 @@ export default function Page() {
 
     const resp = await fetch('http://127.0.0.1:8000/apps', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authed ? { Authorization: `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify({ name: fName.trim(), category: fCategory.trim(), rating: ratingNum, installs: installsNum, platform: fPlatform }),
     });
     if (!resp.ok) return setErr(`Create failed: ${await resp.text()}`);
@@ -102,7 +120,6 @@ export default function Page() {
     ['name','category','platform','rating','installs'].forEach(k => {
       if ((edit as any)[k] !== undefined) payload[k] = (edit as any)[k];
     });
-    // client checks similar to server
     if (payload.name !== undefined && !String(payload.name).trim()) return setErr('Name must not be empty.');
     if (payload.category !== undefined && !String(payload.category).trim()) return setErr('Category must not be empty.');
     if (payload.platform !== undefined && !['ios','android'].includes(payload.platform)) return setErr('Platform must be ios or android.');
@@ -111,7 +128,10 @@ export default function Page() {
 
     const resp = await fetch(`http://127.0.0.1:8000/apps/${id}`, {
       method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(authed ? { Authorization: `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify(payload),
     });
     if (!resp.ok) return setErr(`Update failed: ${await resp.text()}`);
@@ -122,9 +142,11 @@ export default function Page() {
   async function deleteRow(id: number) {
     const ok = confirm('Delete this app?');
     if (!ok) return;
-    const resp = await fetch(`http://127.0.0.1:8000/apps/${id}`, { method: 'DELETE' });
+    const resp = await fetch(`http://127.0.0.1:8000/apps/${id}`, {
+      method: 'DELETE',
+      headers: { ...(authed ? { Authorization: `Bearer ${token}` } : {}) },
+    });
     if (!resp.ok && resp.status !== 204) return setErr(`Delete failed: ${await resp.text()}`);
-    // If we deleted the last item on the page, go back a page if needed
     const newPage = (data && data.items.length === 1 && page > 1) ? page - 1 : page;
     setPage(newPage);
     fetchPage();
@@ -135,6 +157,19 @@ export default function Page() {
   return (
     <main style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
       <h1>App Explorer</h1>
+
+      {/* Admin token */}
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
+        <input
+          type="password"
+          placeholder="Admin token"
+          value={token}
+          onChange={e => setToken(e.target.value)}
+          style={{ width: 220 }}
+        />
+        <button onClick={() => setToken('')}>Logout</button>
+        {!authed && <span style={{ color: '#666' }}>Read‑only mode. Enter token to enable editing.</span>}
+      </div>
 
       {/* Filters */}
       <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
@@ -218,16 +253,20 @@ export default function Page() {
                   ) : row.installs.toLocaleString()}
                 </td>
                 <td>
-                  {!isEditing ? (
-                    <>
-                      <button onClick={() => startEdit(row)}>Edit</button>{' '}
-                      <button onClick={() => deleteRow(row.id)}>Delete</button>
-                    </>
+                  {authed ? (
+                    !isEditing ? (
+                      <>
+                        <button onClick={() => startEdit(row)}>Edit</button>{' '}
+                        <button onClick={() => deleteRow(row.id)}>Delete</button>
+                      </>
+                    ) : (
+                      <>
+                        <button onClick={() => saveEdit(row.id)}>Save</button>{' '}
+                        <button onClick={cancelEdit}>Cancel</button>
+                      </>
+                    )
                   ) : (
-                    <>
-                      <button onClick={() => saveEdit(row.id)}>Save</button>{' '}
-                      <button onClick={cancelEdit}>Cancel</button>
-                    </>
+                    <span style={{ color: '#999' }}>—</span>
                   )}
                 </td>
               </tr>
@@ -250,18 +289,21 @@ export default function Page() {
       {/* Create form */}
       <hr style={{ margin: '24px 0' }} />
       <h2>Add New App</h2>
-      <form onSubmit={handleCreate} style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 1fr 120px', gap: 8, alignItems: 'center' }}>
-        <input placeholder="Name" value={fName} onChange={e => setFName(e.target.value)} />
-        <input placeholder="Category" value={fCategory} onChange={e => setFCategory(e.target.value)} />
-        <select value={fPlatform} onChange={e => setFPlatform(e.target.value as any)}>
-          <option value="">Platform</option>
-          <option value="ios">iOS</option>
-          <option value="android">Android</option>
-        </select>
-        <input type="number" step="0.1" min={0} max={5} placeholder="Rating" value={fRating} onChange={e => setFRating((e.target.value === '') ? '' : Number(e.target.value))} />
-        <input type="number" step="1" min={0} placeholder="Installs" value={fInstalls} onChange={e => setFInstalls((e.target.value === '') ? '' : Number(e.target.value))} />
-        <button type="submit">Create</button>
-      </form>
+      {!authed && <p style={{ color:'#666' }}>Enter admin token above to add apps.</p>}
+      {authed && (
+        <form onSubmit={handleCreate} style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 1fr 120px', gap: 8, alignItems: 'center' }}>
+          <input placeholder="Name" value={fName} onChange={e => setFName(e.target.value)} />
+          <input placeholder="Category" value={fCategory} onChange={e => setFCategory(e.target.value)} />
+          <select value={fPlatform} onChange={e => setFPlatform(e.target.value as any)}>
+            <option value="">Platform</option>
+            <option value="ios">iOS</option>
+            <option value="android">Android</option>
+          </select>
+          <input type="number" step="0.1" min={0} max={5} placeholder="Rating" value={fRating} onChange={e => setFRating((e.target.value === '') ? '' : Number(e.target.value))} />
+          <input type="number" step="1" min={0} placeholder="Installs" value={fInstalls} onChange={e => setFInstalls((e.target.value === '') ? '' : Number(e.target.value))} />
+          <button type="submit">Create</button>
+        </form>
+      )}
     </main>
   );
 }

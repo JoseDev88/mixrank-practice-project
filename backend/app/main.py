@@ -1,12 +1,29 @@
 from typing import List, Optional
-from fastapi import FastAPI, Query, HTTPException, Path
+from fastapi import FastAPI, Query, HTTPException, Path, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from sqlalchemy import create_engine, Column, Integer, String, Float
 from sqlalchemy.orm import declarative_base, Session
+import os
+
+# --- Auth / Admin token ---
+# Set ADMIN_TOKEN in your environment; when empty, writes are allowed (dev mode).
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
+def require_admin(authorization: str = Header(default="")):
+    """
+    Expect header: Authorization: Bearer <ADMIN_TOKEN>
+    If ADMIN_TOKEN is unset, allow writes (developer convenience).
+    """
+    if not ADMIN_TOKEN:
+        return True  # dev mode
+    parts = authorization.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] == ADMIN_TOKEN:
+        return True
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 # --- FastAPI app ---
-app = FastAPI(title="App Explorer API", version="0.5.0")
+app = FastAPI(title="App Explorer API", version="0.6.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -182,7 +199,7 @@ def list_apps(
         ) for r in rows]
         return Page(items=items, total=total, page=page, page_size=page_size)
 
-@app.post("/apps", response_model=AppOut, status_code=201)
+@app.post("/apps", response_model=AppOut, status_code=201, dependencies=[Depends(require_admin)])
 def create_app(payload: AppCreate):
     with Session(engine) as s:
         exists = s.query(AppRow).filter(AppRow.name == payload.name, AppRow.platform == payload.platform).first()
@@ -194,7 +211,7 @@ def create_app(payload: AppCreate):
         s.refresh(row)
         return AppOut(**row.__dict__)
 
-@app.put("/apps/{app_id}", response_model=AppOut)
+@app.put("/apps/{app_id}", response_model=AppOut, dependencies=[Depends(require_admin)])
 def update_app(
     app_id: int = Path(..., ge=1),
     payload: AppUpdate = ...,
@@ -219,7 +236,7 @@ def update_app(
         s.refresh(row)
         return AppOut(**row.__dict__)
 
-@app.delete("/apps/{app_id}", status_code=204)
+@app.delete("/apps/{app_id}", status_code=204, dependencies=[Depends(require_admin)])
 def delete_app(app_id: int = Path(..., ge=1)):
     with Session(engine) as s:
         row = s.get(AppRow, app_id)
