@@ -3,13 +3,16 @@ import os, sys
 # Ensure the backend folder (parent of "migrations") is on sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+# NEW: signal to the app that Alembic is running so it won't bootstrap the DB
+os.environ["ALEMBIC_RUNNING"] = "1"
+
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 from alembic import context
 
-# Import your SQLAlchemy Base after the path tweak above
+# Import your SQLAlchemy Base after the path + env tweak above
 from app.main import Base
 
 # this is the Alembic Config object, which provides

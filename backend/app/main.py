@@ -6,10 +6,11 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, field_validator
 from sqlalchemy import create_engine, Column, Integer, String, Float
 from sqlalchemy.orm import declarative_base, Session
-import os, time, csv, io, logging
+import os, time, csv, io, logging, hashlib
 from logging.handlers import RotatingFileHandler
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+from urllib.parse import urlencode, urlsplit, urlunsplit, parse_qsl
 
 # ---------------------------
 # Config (env overrides)
@@ -22,8 +23,6 @@ LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(5 * 1024 * 1024)))  # 5 
 LOG_BACKUPS = int(os.environ.get("LOG_BACKUPS", "3"))
 
 # Rate limiting (per-IP sliding window)
-# Reads:
-#   RATE_LIMIT_GET=<int/60s>, RATE_LIMIT_WRITE=<int/60s>, RATE_LIMIT_WINDOW_SECONDS=<int>
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
 RATE_LIMIT_GET = int(os.environ.get("RATE_LIMIT_GET", "120"))      # per window (GET, HEAD)
 RATE_LIMIT_WRITE = int(os.environ.get("RATE_LIMIT_WRITE", "30"))   # per window (POST, PUT, DELETE)
@@ -40,7 +39,6 @@ if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
-# Console output (uvicorn will also print, but we control format here)
 if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
     sh = logging.StreamHandler()
     sh.setLevel(logging.INFO)
@@ -50,7 +48,7 @@ if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
 # ---------------------------
 # App + CORS
 # ---------------------------
-app = FastAPI(title="App Explorer API", version="0.9.0")
+app = FastAPI(title="App Explorer API", version="1.1.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],  # adjust in prod
@@ -62,27 +60,21 @@ app.add_middleware(
 # ---------------------------
 # Metrics (very lightweight)
 # ---------------------------
-# requests_total[(method, path, status)] = count
 requests_total: Dict[Tuple[str, str, int], int] = defaultdict(int)
-# request_duration_ms[(method, path)] = deque of recent durations (cap to avoid memory growth)
 request_duration_ms: Dict[Tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=500))
 
 # ---------------------------
 # Rate limiting storage
 # ---------------------------
-# hits[(ip, bucket)] = deque[timestamps]; bucket is "GET" or "WRITE"
 hits: Dict[Tuple[str, str], deque] = defaultdict(lambda: deque())
 
 def _ip_from_request(req: Request) -> str:
-    # Try common proxy headers first if you later run behind a reverse proxy
     xfwd = req.headers.get("x-forwarded-for")
     if xfwd:
-        # take first IP
         return xfwd.split(",")[0].strip()
     return req.client.host if req.client and req.client.host else "unknown"
 
 def rate_limiter(kind: str):
-    """Dependency factory: kind in {'GET', 'WRITE'}."""
     limit = RATE_LIMIT_GET if kind == "GET" else RATE_LIMIT_WRITE
     window = timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
 
@@ -91,17 +83,12 @@ def rate_limiter(kind: str):
         key = (ip, kind)
         now = datetime.utcnow()
         q = hits[key]
-
-        # purge old timestamps outside window
         while q and (now - q[0]) > window:
             q.popleft()
-
         if len(q) >= limit:
             raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({kind.lower()}), try later")
-
         q.append(now)
         return True
-
     return _inner
 
 # ---------------------------
@@ -116,7 +103,7 @@ async def validation_exception_handler(request, exc):
 # ---------------------------
 def require_admin(authorization: str = Header(default="")):
     if not ADMIN_TOKEN:
-        return True  # dev mode (no token configured)
+        return True  # dev mode
     parts = authorization.split()
     if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] == ADMIN_TOKEN:
         return True
@@ -138,7 +125,6 @@ async def timing_and_logging(request: Request, call_next):
     t0 = time.perf_counter()
     method = request.method
     path = request.url.path
-
     try:
         response: Response = await call_next(request)
         status = response.status_code
@@ -157,6 +143,7 @@ async def timing_and_logging(request: Request, call_next):
 # DB setup
 # ---------------------------
 DB_URL = "sqlite:///./app_explorer.db"
+DB_PATH = "./app_explorer.db"  # for quick mtime checks (ETag/Last-Modified)
 engine = create_engine(DB_URL, echo=False, future=True)
 Base = declarative_base()
 
@@ -168,20 +155,27 @@ class AppRow(Base):
     rating = Column(Float, nullable=False)
     installs = Column(Integer, nullable=False)
     platform = Column(String, nullable=False)  # "ios" | "android"
+    price = Column(Float, nullable=False, server_default="0.0")  # NEW
 
 def bootstrap():
+    # Extra safety: never bootstrap while Alembic is running
+    if os.getenv("ALEMBIC_RUNNING") == "1":
+        return
     Base.metadata.create_all(engine)
     with Session(engine) as s:
         if s.query(AppRow).count() == 0:
             s.add_all([
-                AppRow(name="Pixel Painter", category="Art", rating=4.6, installs=50000, platform="android"),
-                AppRow(name="FitTrack", category="Fitness", rating=4.2, installs=150000, platform="ios"),
-                AppRow(name="Budget Buddy", category="Finance", rating=4.7, installs=75000, platform="android"),
-                AppRow(name="StudySpark", category="Education", rating=4.4, installs=120000, platform="ios"),
-                AppRow(name="CalmClock", category="Productivity", rating=4.8, installs=300000, platform="android"),
+                AppRow(name="Pixel Painter", category="Art", rating=4.6, installs=50000, platform="android", price=0.0),
+                AppRow(name="FitTrack", category="Fitness", rating=4.2, installs=150000, platform="ios", price=4.99),
+                AppRow(name="Budget Buddy", category="Finance", rating=4.7, installs=75000, platform="android", price=0.0),
+                AppRow(name="StudySpark", category="Education", rating=4.4, installs=120000, platform="ios", price=2.99),
+                AppRow(name="CalmClock", category="Productivity", rating=4.8, installs=300000, platform="android", price=0.0),
             ])
             s.commit()
-bootstrap()
+
+# Only call bootstrap when not in Alembic context
+if os.getenv("ALEMBIC_RUNNING") != "1":
+    bootstrap()
 
 # ---------------------------
 # Schemas
@@ -193,6 +187,7 @@ class AppOut(BaseModel):
     rating: float
     installs: int
     platform: str
+    price: float  # NEW
 
 class AppCreate(BaseModel):
     name: str
@@ -200,6 +195,7 @@ class AppCreate(BaseModel):
     rating: float
     installs: int
     platform: str
+    price: float  # NEW
 
     @field_validator("name", "category")
     @classmethod
@@ -230,12 +226,20 @@ class AppCreate(BaseModel):
             raise ValueError("platform must be ios or android")
         return v2
 
+    @field_validator("price")
+    @classmethod
+    def price_nonneg(cls, v: float):
+        if v < 0:
+            raise ValueError("price must be >= 0")
+        return v
+
 class AppUpdate(BaseModel):
     name: Optional[str] = None
     category: Optional[str] = None
     rating: Optional[float] = None
     installs: Optional[int] = None
     platform: Optional[str] = None
+    price: Optional[float] = None  # NEW
 
     @field_validator("name", "category")
     @classmethod
@@ -274,16 +278,27 @@ class AppUpdate(BaseModel):
             raise ValueError("platform must be ios or android")
         return v2
 
+    @field_validator("price")
+    @classmethod
+    def price_nonneg_opt(cls, v: Optional[float]):
+        if v is None:
+            return v
+        if v < 0:
+            raise ValueError("price must be >= 0")
+        return v
+
 class Page(BaseModel):
     items: List[AppOut]
     total: int
     page: int
     page_size: int
+    next_url: Optional[str] = None
+    prev_url: Optional[str] = None
 
 # ---------------------------
 # Helpers
 # ---------------------------
-ALLOWED_SORT_FIELDS = {"rating", "installs", "name"}
+ALLOWED_SORT_FIELDS = {"rating", "installs", "name"}  # add 'price' later if you want to sort by it too
 ALLOWED_DIRS = {"asc", "desc"}
 
 def apply_list_query(
@@ -308,6 +323,28 @@ def apply_list_query(
     query = query.order_by(order_col.desc() if sort_dir == "desc" else order_col.asc(), AppRow.id.asc())
     return query
 
+# ---- Day 10: caching + links helpers ----
+def _db_mtime() -> int:
+    try:
+        return int(os.path.getmtime(DB_PATH))
+    except Exception:
+        return 0
+
+def _with_params(url: str, overrides: dict) -> str:
+    scheme, netloc, path, query, frag = urlsplit(url)
+    q = dict(parse_qsl(query, keep_blank_values=True))
+    for k, v in overrides.items():
+        if v is None:
+            q.pop(k, None)
+        else:
+            q[k] = v
+    new_q = urlencode(q, doseq=True)
+    return urlunsplit((scheme, netloc, path, new_q, frag))
+
+def _etag_for_list(total: int, mtime: int, params_fingerprint: str) -> str:
+    h = hashlib.sha256(f"{total}:{mtime}:{params_fingerprint}".encode()).hexdigest()[:16]
+    return f'W/"{h}"'
+
 # ---------------------------
 # Routes
 # ---------------------------
@@ -317,6 +354,7 @@ def health():
 
 @app.get("/apps", response_model=Page, dependencies=[Depends(rate_limiter("GET"))])
 def list_apps(
+    request: Request,
     q: Optional[str] = Query(None),
     category: Optional[str] = Query(None),
     platform: Optional[str] = Query(None, pattern="^(ios|android)$"),
@@ -332,10 +370,45 @@ def list_apps(
     with Session(engine) as s:
         query = apply_list_query(s, q, category, platform, min_rating, sort_by, sort_dir)
         total = query.count()
+
+        # ETag + Last-Modified
+        params_fingerprint = f"{q}|{category}|{platform}|{min_rating}|{sort_by}|{sort_dir}|{page}|{page_size}"
+        mtime = _db_mtime()
+        etag = _etag_for_list(total, mtime, params_fingerprint)
+        last_mod_http = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(mtime))
+
+        inm = request.headers.get("if-none-match")
+        ims = request.headers.get("if-modified-since")
+        if inm == etag or (ims and ims == last_mod_http):
+            resp = Response(status_code=304)
+            resp.headers["ETag"] = etag
+            resp.headers["Last-Modified"] = last_mod_http
+            return resp
+
         rows = query.offset((page - 1) * page_size).limit(page_size).all()
-        items = [AppOut.model_validate({"id": r.id, "name": r.name, "category": r.category,
-                                        "rating": r.rating, "installs": r.installs, "platform": r.platform}) for r in rows]
-        return Page(items=items, total=total, page=page, page_size=page_size)
+        items = [AppOut.model_validate({
+            "id": r.id, "name": r.name, "category": r.category,
+            "rating": r.rating, "installs": r.installs, "platform": r.platform,
+            "price": r.price,
+        }) for r in rows]
+
+        # Pagination link hints
+        base_url = str(request.url)
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        next_url = _with_params(base_url, {"page": page + 1}) if page < total_pages else None
+        prev_url = _with_params(base_url, {"page": page - 1}) if page > 1 else None
+
+        payload = Page(items=items, total=total, page=page, page_size=page_size,
+                       next_url=next_url, prev_url=prev_url).model_dump()
+        out = JSONResponse(payload)
+        out.headers["ETag"] = etag
+        out.headers["Last-Modified"] = last_mod_http
+        links = []
+        if next_url: links.append(f'<{next_url}>; rel="next"')
+        if prev_url: links.append(f'<{prev_url}>; rel="prev"')
+        if links:
+            out.headers["Link"] = ", ".join(links)
+        return out
 
 @app.get("/apps/export.csv", dependencies=[Depends(rate_limiter("GET"))])
 def export_apps_csv(
@@ -352,9 +425,9 @@ def export_apps_csv(
         rows = apply_list_query(s, q, category, platform, min_rating, sort_by, sort_dir).all()
         buf = io.StringIO()
         w = csv.writer(buf)
-        w.writerow(["id","name","category","platform","rating","installs"])
+        w.writerow(["id","name","category","platform","rating","installs","price"])
         for r in rows:
-            w.writerow([r.id, r.name, r.category, r.platform, r.rating, r.installs])
+            w.writerow([r.id, r.name, r.category, r.platform, r.rating, r.installs, r.price])
         out = buf.getvalue()
     headers = {"Content-Disposition": 'attachment; filename="apps_export.csv"'}
     return PlainTextResponse(out, headers=headers, media_type="text/csv")
@@ -370,7 +443,11 @@ def create_app(payload: AppCreate):
         s.add(row)
         s.commit()
         s.refresh(row)
-        return AppOut(**row.__dict__)
+        return AppOut.model_validate({
+            "id": row.id, "name": row.name, "category": row.category,
+            "rating": row.rating, "installs": row.installs, "platform": row.platform,
+            "price": row.price,
+        })
 
 @app.put("/apps/{app_id}", response_model=AppOut,
          dependencies=[Depends(require_admin), Depends(rate_limiter("WRITE"))])
@@ -390,7 +467,11 @@ def update_app(app_id: int = Path(..., ge=1), payload: AppUpdate = ...):
             setattr(row, k, v)
         s.commit()
         s.refresh(row)
-        return AppOut(**row.__dict__)
+        return AppOut.model_validate({
+            "id": row.id, "name": row.name, "category": row.category,
+            "rating": row.rating, "installs": row.installs, "platform": row.platform,
+            "price": row.price,
+        })
 
 @app.delete("/apps/{app_id}", status_code=204,
             dependencies=[Depends(require_admin), Depends(rate_limiter("WRITE"))])
@@ -409,7 +490,6 @@ def delete_app(app_id: int = Path(..., ge=1)):
 @app.get("/metrics")
 def metrics(format: Optional[str] = Query(None, description="pass 'prom' for Prometheus text format")):
     if format == "prom":
-        # Prometheus-style exposition (very basic)
         lines = []
         lines.append("# HELP requests_total Count of requests by method/path/status")
         lines.append("# TYPE requests_total counter")
@@ -418,10 +498,9 @@ def metrics(format: Optional[str] = Query(None, description="pass 'prom' for Pro
         lines.append("# HELP request_duration_ms Recent request durations (last 500), avg")
         lines.append("# TYPE request_duration_ms gauge")
         for (method, path), dq in sorted(request_duration_ms.items()):
-            avg = (sum(dq)/len(dq)) if dq else 0.0
+            avg = (sum(d)/len(d) if d else 0.0)
             lines.append(f'request_duration_ms{{method="{method}",path="{path}"}} {avg:.2f}')
         return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain")
-    # JSON default
     by_key = {f"{m} {p} {s}": c for (m,p,s), c in requests_total.items()}
     avg_ms = {f"{m} {p}": (sum(d)/len(d) if d else 0.0) for (m,p), d in request_duration_ms.items()}
     return {"requests_total": by_key, "request_duration_ms_avg": avg_ms}
