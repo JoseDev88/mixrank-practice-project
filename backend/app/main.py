@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 from fastapi import FastAPI, Query, HTTPException, Path, Depends, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -6,21 +6,51 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, field_validator
 from sqlalchemy import create_engine, Column, Integer, String, Float
 from sqlalchemy.orm import declarative_base, Session
-import os, time, csv, io
+import os, time, csv, io, logging
+from logging.handlers import RotatingFileHandler
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
 
-# --- Auth / Admin token ---
+# ---------------------------
+# Config (env overrides)
+# ---------------------------
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-def require_admin(authorization: str = Header(default="")):
-    if not ADMIN_TOKEN:
-        return True  # dev mode (no token configured)
-    parts = authorization.split()
-    if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] == ADMIN_TOKEN:
-        return True
-    raise HTTPException(status_code=401, detail="Unauthorized")
+LOG_DIR = os.environ.get("LOG_DIR", "logs")
+LOG_FILE = os.environ.get("LOG_FILE", os.path.join(LOG_DIR, "app.log"))
+LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", str(5 * 1024 * 1024)))  # 5 MB
+LOG_BACKUPS = int(os.environ.get("LOG_BACKUPS", "3"))
 
-# --- FastAPI app ---
-app = FastAPI(title="App Explorer API", version="0.8.0")
+# Rate limiting (per-IP sliding window)
+# Reads:
+#   RATE_LIMIT_GET=<int/60s>, RATE_LIMIT_WRITE=<int/60s>, RATE_LIMIT_WINDOW_SECONDS=<int>
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60"))
+RATE_LIMIT_GET = int(os.environ.get("RATE_LIMIT_GET", "120"))      # per window (GET, HEAD)
+RATE_LIMIT_WRITE = int(os.environ.get("RATE_LIMIT_WRITE", "30"))   # per window (POST, PUT, DELETE)
+
+# ---------------------------
+# Logging setup
+# ---------------------------
+os.makedirs(LOG_DIR, exist_ok=True)
+logger = logging.getLogger("app")
+logger.setLevel(logging.INFO)
+if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+    fh = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS)
+    fh.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+# Console output (uvicorn will also print, but we control format here)
+if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(sh)
+
+# ---------------------------
+# App + CORS
+# ---------------------------
+app = FastAPI(title="App Explorer API", version="0.9.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],  # adjust in prod
@@ -29,35 +59,103 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Timing / access log (very lightweight)
-@app.middleware("http")
-async def timing_logger(request: Request, call_next):
-    t0 = time.perf_counter()
-    try:
-        response: Response = await call_next(request)
-        return response
-    finally:
-        dt_ms = (time.perf_counter() - t0) * 1000
-        path = request.url.path
-        method = request.method
-        status = getattr(response, "status_code", "?")
-        print(f"{method} {path} -> {status} in {dt_ms:.1f} ms")
+# ---------------------------
+# Metrics (very lightweight)
+# ---------------------------
+# requests_total[(method, path, status)] = count
+requests_total: Dict[Tuple[str, str, int], int] = defaultdict(int)
+# request_duration_ms[(method, path)] = deque of recent durations (cap to avoid memory growth)
+request_duration_ms: Dict[Tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=500))
 
-# Nicer 422 output
+# ---------------------------
+# Rate limiting storage
+# ---------------------------
+# hits[(ip, bucket)] = deque[timestamps]; bucket is "GET" or "WRITE"
+hits: Dict[Tuple[str, str], deque] = defaultdict(lambda: deque())
+
+def _ip_from_request(req: Request) -> str:
+    # Try common proxy headers first if you later run behind a reverse proxy
+    xfwd = req.headers.get("x-forwarded-for")
+    if xfwd:
+        # take first IP
+        return xfwd.split(",")[0].strip()
+    return req.client.host if req.client and req.client.host else "unknown"
+
+def rate_limiter(kind: str):
+    """Dependency factory: kind in {'GET', 'WRITE'}."""
+    limit = RATE_LIMIT_GET if kind == "GET" else RATE_LIMIT_WRITE
+    window = timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
+
+    async def _inner(request: Request):
+        ip = _ip_from_request(request)
+        key = (ip, kind)
+        now = datetime.utcnow()
+        q = hits[key]
+
+        # purge old timestamps outside window
+        while q and (now - q[0]) > window:
+            q.popleft()
+
+        if len(q) >= limit:
+            raise HTTPException(status_code=429, detail=f"Rate limit exceeded ({kind.lower()}), try later")
+
+        q.append(now)
+        return True
+
+    return _inner
+
+# ---------------------------
+# Exceptions
+# ---------------------------
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
+# ---------------------------
 # Auth helpers
-@app.get("/auth/mode")
+# ---------------------------
+def require_admin(authorization: str = Header(default="")):
+    if not ADMIN_TOKEN:
+        return True  # dev mode (no token configured)
+    parts = authorization.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] == ADMIN_TOKEN:
+        return True
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+@app.get("/auth/mode", dependencies=[Depends(rate_limiter("GET"))])
 def auth_mode():
     return {"requires_token": bool(ADMIN_TOKEN)}
 
-@app.get("/auth/check", dependencies=[Depends(require_admin)])
+@app.get("/auth/check", dependencies=[Depends(require_admin), Depends(rate_limiter("GET"))])
 def auth_check():
     return {"ok": True}
 
-# --- SQLite + SQLAlchemy setup ---
+# ---------------------------
+# Timing + access logging middleware + metrics
+# ---------------------------
+@app.middleware("http")
+async def timing_and_logging(request: Request, call_next):
+    t0 = time.perf_counter()
+    method = request.method
+    path = request.url.path
+
+    try:
+        response: Response = await call_next(request)
+        status = response.status_code
+        return response
+    except Exception as e:
+        status = 500
+        logger.exception(f"Unhandled error on {method} {path}: {e}")
+        raise
+    finally:
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        requests_total[(method, path, status)] += 1
+        request_duration_ms[(method, path)].append(dt_ms)
+        logger.info(f'{method} {path} -> {status} in {dt_ms:.1f} ms')
+
+# ---------------------------
+# DB setup
+# ---------------------------
 DB_URL = "sqlite:///./app_explorer.db"
 engine = create_engine(DB_URL, echo=False, future=True)
 Base = declarative_base()
@@ -85,7 +183,9 @@ def bootstrap():
             s.commit()
 bootstrap()
 
-# --- Pydantic models ---
+# ---------------------------
+# Schemas
+# ---------------------------
 class AppOut(BaseModel):
     id: int
     name: str
@@ -180,10 +280,9 @@ class Page(BaseModel):
     page: int
     page_size: int
 
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
+# ---------------------------
+# Helpers
+# ---------------------------
 ALLOWED_SORT_FIELDS = {"rating", "installs", "name"}
 ALLOWED_DIRS = {"asc", "desc"}
 
@@ -209,7 +308,14 @@ def apply_list_query(
     query = query.order_by(order_col.desc() if sort_dir == "desc" else order_col.asc(), AppRow.id.asc())
     return query
 
-@app.get("/apps", response_model=Page)
+# ---------------------------
+# Routes
+# ---------------------------
+@app.get("/health", dependencies=[Depends(rate_limiter("GET"))])
+def health():
+    return {"status": "ok"}
+
+@app.get("/apps", response_model=Page, dependencies=[Depends(rate_limiter("GET"))])
 def list_apps(
     q: Optional[str] = Query(None),
     category: Optional[str] = Query(None),
@@ -231,7 +337,7 @@ def list_apps(
                                         "rating": r.rating, "installs": r.installs, "platform": r.platform}) for r in rows]
         return Page(items=items, total=total, page=page, page_size=page_size)
 
-@app.get("/apps/export.csv")
+@app.get("/apps/export.csv", dependencies=[Depends(rate_limiter("GET"))])
 def export_apps_csv(
     q: Optional[str] = Query(None),
     category: Optional[str] = Query(None),
@@ -240,7 +346,6 @@ def export_apps_csv(
     sort_by: str = Query("rating"),
     sort_dir: str = Query("desc"),
 ):
-    """Exports the full filtered list (ignores pagination) as CSV."""
     if sort_by not in ALLOWED_SORT_FIELDS or sort_dir not in ALLOWED_DIRS:
         raise HTTPException(status_code=400, detail="Invalid sort_by or sort_dir")
     with Session(engine) as s:
@@ -254,7 +359,8 @@ def export_apps_csv(
     headers = {"Content-Disposition": 'attachment; filename="apps_export.csv"'}
     return PlainTextResponse(out, headers=headers, media_type="text/csv")
 
-@app.post("/apps", response_model=AppOut, status_code=201, dependencies=[Depends(require_admin)])
+@app.post("/apps", response_model=AppOut, status_code=201,
+          dependencies=[Depends(require_admin), Depends(rate_limiter("WRITE"))])
 def create_app(payload: AppCreate):
     with Session(engine) as s:
         exists = s.query(AppRow).filter(AppRow.name == payload.name, AppRow.platform == payload.platform).first()
@@ -266,7 +372,8 @@ def create_app(payload: AppCreate):
         s.refresh(row)
         return AppOut(**row.__dict__)
 
-@app.put("/apps/{app_id}", response_model=AppOut, dependencies=[Depends(require_admin)])
+@app.put("/apps/{app_id}", response_model=AppOut,
+         dependencies=[Depends(require_admin), Depends(rate_limiter("WRITE"))])
 def update_app(app_id: int = Path(..., ge=1), payload: AppUpdate = ...):
     with Session(engine) as s:
         row = s.get(AppRow, app_id)
@@ -285,7 +392,8 @@ def update_app(app_id: int = Path(..., ge=1), payload: AppUpdate = ...):
         s.refresh(row)
         return AppOut(**row.__dict__)
 
-@app.delete("/apps/{app_id}", status_code=204, dependencies=[Depends(require_admin)])
+@app.delete("/apps/{app_id}", status_code=204,
+            dependencies=[Depends(require_admin), Depends(rate_limiter("WRITE"))])
 def delete_app(app_id: int = Path(..., ge=1)):
     with Session(engine) as s:
         row = s.get(AppRow, app_id)
@@ -294,3 +402,26 @@ def delete_app(app_id: int = Path(..., ge=1)):
         s.delete(row)
         s.commit()
         return None
+
+# ---------------------------
+# Metrics endpoint
+# ---------------------------
+@app.get("/metrics")
+def metrics(format: Optional[str] = Query(None, description="pass 'prom' for Prometheus text format")):
+    if format == "prom":
+        # Prometheus-style exposition (very basic)
+        lines = []
+        lines.append("# HELP requests_total Count of requests by method/path/status")
+        lines.append("# TYPE requests_total counter")
+        for (method, path, status), cnt in sorted(requests_total.items()):
+            lines.append(f'requests_total{{method="{method}",path="{path}",status="{status}"}} {cnt}')
+        lines.append("# HELP request_duration_ms Recent request durations (last 500), avg")
+        lines.append("# TYPE request_duration_ms gauge")
+        for (method, path), dq in sorted(request_duration_ms.items()):
+            avg = (sum(dq)/len(dq)) if dq else 0.0
+            lines.append(f'request_duration_ms{{method="{method}",path="{path}"}} {avg:.2f}')
+        return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain")
+    # JSON default
+    by_key = {f"{m} {p} {s}": c for (m,p,s), c in requests_total.items()}
+    avg_ms = {f"{m} {p}": (sum(d)/len(d) if d else 0.0) for (m,p), d in request_duration_ms.items()}
+    return {"requests_total": by_key, "request_duration_ms_avg": avg_ms}
