@@ -17,17 +17,17 @@ def require_admin(authorization: str = Header(default="")):
     If ADMIN_TOKEN is unset, allow writes (developer convenience).
     """
     if not ADMIN_TOKEN:
-        return True  # dev mode
+        return True  # dev mode (no token configured)
     parts = authorization.split()
     if len(parts) == 2 and parts[0].lower() == "bearer" and parts[1] == ADMIN_TOKEN:
         return True
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 # --- FastAPI app ---
-app = FastAPI(title="App Explorer API", version="0.7.0")
+app = FastAPI(title="App Explorer API", version="0.7.1")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # adjust if you deploy frontend elsewhere
+    allow_origins=["http://localhost:3000"],  # adjust in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -37,6 +37,16 @@ app.add_middleware(
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+# Public endpoint to tell the frontend whether a token is required
+@app.get("/auth/mode")
+def auth_mode():
+    return {"requires_token": bool(ADMIN_TOKEN)}
+
+# Protected endpoint to validate a bearer token
+@app.get("/auth/check", dependencies=[Depends(require_admin)])
+def auth_check():
+    return {"ok": True}
 
 # --- SQLite + SQLAlchemy setup ---
 DB_URL = "sqlite:///./app_explorer.db"

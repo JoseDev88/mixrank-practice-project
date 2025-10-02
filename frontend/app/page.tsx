@@ -30,9 +30,7 @@ async function extractError(res: Response) {
       if (typeof j.detail === 'string') return j.detail;
       return JSON.stringify(j.detail);
     }
-  } catch {
-    /* ignore JSON parse errors */
-  }
+  } catch {}
   return msg || res.statusText;
 }
 
@@ -61,10 +59,23 @@ export default function Page() {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [edit, setEdit] = useState<Partial<AppItem>>({});
 
-  // auth state (admin token stored in localStorage)
+  // Auth state
   const [token, setToken] = useState<string>('');
-  const authed = Boolean(token);
+  const [requiresToken, setRequiresToken] = useState<boolean>(false);
+  const [authed, setAuthed] = useState<boolean>(false); // true only after validation
 
+  // Load auth mode on mount
+  useEffect(() => {
+    fetch(`${API_BASE}/auth/mode`)
+      .then(r => r.json())
+      .then(({ requires_token }) => {
+        setRequiresToken(Boolean(requires_token));
+        if (!requires_token) setAuthed(true); // dev mode: writes allowed without token
+      })
+      .catch(() => setRequiresToken(false));
+  }, []);
+
+  // Restore saved token and validate if needed
   useEffect(() => {
     const saved = typeof window !== 'undefined' ? localStorage.getItem('admintoken') : '';
     if (saved) setToken(saved);
@@ -74,7 +85,19 @@ export default function Page() {
       if (token) localStorage.setItem('admintoken', token);
       else localStorage.removeItem('admintoken');
     }
-  }, [token]);
+    // validate token with backend only if a token is actually required
+    if (requiresToken) {
+      if (!token) { setAuthed(false); return; }
+      const controller = new AbortController();
+      fetch(`${API_BASE}/auth/check`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
+      })
+        .then(res => setAuthed(res.ok))
+        .catch(() => setAuthed(false));
+      return () => controller.abort();
+    }
+  }, [token, requiresToken]);
 
   // Build URL params from current state
   const queryString = useMemo(() => {
@@ -90,13 +113,12 @@ export default function Page() {
     return params.toString();
   }, [q, category, platform, minRating, sortBy, sortDir, page]);
 
-  // Debounced fetch: wait 300ms after last change; cancel in-flight requests
+  // Debounced fetch
   const abortRef = useRef<AbortController | null>(null);
   useEffect(() => {
     setLoading(true);
     setErr(null);
 
-    // abort previous request (if any)
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -108,31 +130,28 @@ export default function Page() {
           return res.json();
         })
         .then(setData)
-        .catch((e: any) => {
-          if (e.name !== 'AbortError') setErr(e.message || String(e));
-        })
+        .catch((e: any) => { if (e.name !== 'AbortError') setErr(e.message || String(e)); })
         .finally(() => setLoading(false));
     }, 300);
 
-    return () => {
-      controller.abort();
-      clearTimeout(tid);
-    };
+    return () => { controller.abort(); clearTimeout(tid); };
   }, [queryString]);
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     setErr(null);
+    if (!authed) { setErr('You are not authorized to create items.'); return; }
+
     const ratingNum = Number(fRating), installsNum = Number(fInstalls);
     if (!fName.trim() || !fCategory.trim() || !fPlatform) return setErr('Please fill name, category, and platform.');
     if (Number.isNaN(ratingNum) || ratingNum < 0 || ratingNum > 5) return setErr('Rating must be 0–5.');
-    if (!Number.isInteger(installsNum) || installsNum < 0) return setErr('Installs must be a non-negative integer.');
+    if (!Number.isInteger(installsNum) || installsNum < 0) return setErr('Installs must be a non‑negative integer.');
 
     const resp = await fetch(`${API_BASE}/apps`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(authed ? { Authorization: `Bearer ${token}` } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify({ name: fName.trim(), category: fCategory.trim(), rating: ratingNum, installs: installsNum, platform: fPlatform }),
     });
@@ -144,19 +163,15 @@ export default function Page() {
 
     setFName(''); setFCategory(''); setFRating(''); setFInstalls(''); setFPlatform('');
     setPage(1);
-    // force refresh (keeps debounce but re-runs immediately by tweaking state)
     setErr(null);
   }
 
-  function startEdit(row: AppItem) {
-    setEditingId(row.id);
-    setEdit({ ...row });
-  }
-  function cancelEdit() {
-    setEditingId(null);
-    setEdit({});
-  }
+  function startEdit(row: AppItem) { setEditingId(row.id); setEdit({ ...row }); }
+  function cancelEdit() { setEditingId(null); setEdit({}); }
+
   async function saveEdit(id: number) {
+    if (!authed) { setErr('You are not authorized to update items.'); return; }
+
     const payload: any = {};
     ['name','category','platform','rating','installs'].forEach(k => {
       if ((edit as any)[k] !== undefined) payload[k] = (edit as any)[k];
@@ -165,13 +180,13 @@ export default function Page() {
     if (payload.category !== undefined && !String(payload.category).trim()) return setErr('Category must not be empty.');
     if (payload.platform !== undefined && !['ios','android'].includes(payload.platform)) return setErr('Platform must be ios or android.');
     if (payload.rating !== undefined && (payload.rating < 0 || payload.rating > 5)) return setErr('Rating must be 0–5.');
-    if (payload.installs !== undefined && (!Number.isInteger(payload.installs) || payload.installs < 0)) return setErr('Installs must be a non-negative integer.');
+    if (payload.installs !== undefined && (!Number.isInteger(payload.installs) || payload.installs < 0)) return setErr('Installs must be a non‑negative integer.');
 
     const resp = await fetch(`${API_BASE}/apps/${id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
-        ...(authed ? { Authorization: `Bearer ${token}` } : {}),
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
       },
       body: JSON.stringify(payload),
     });
@@ -186,11 +201,12 @@ export default function Page() {
   }
 
   async function deleteRow(id: number) {
-    const ok = confirm('Delete this app?');
-    if (!ok) return;
+    if (!authed) { setErr('You are not authorized to delete items.'); return; }
+    const ok = confirm('Delete this app?'); if (!ok) return;
+
     const resp = await fetch(`${API_BASE}/apps/${id}`, {
       method: 'DELETE',
-      headers: { ...(authed ? { Authorization: `Bearer ${token}` } : {}) },
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
     });
     if (!resp.ok && resp.status !== 204) {
       const msg = await extractError(resp);
@@ -212,13 +228,19 @@ export default function Page() {
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 12 }}>
         <input
           type="password"
-          placeholder="Admin token"
+          placeholder={requiresToken ? "Admin token" : "Dev mode (no token required)"}
           value={token}
           onChange={e => setToken(e.target.value)}
-          style={{ width: 220 }}
+          style={{ width: 260 }}
         />
         <button onClick={() => setToken('')}>Logout</button>
-        {!authed && <span style={{ color: '#666' }}>Read-only mode. Enter token to enable editing.</span>}
+        {requiresToken ? (
+          <span style={{ color: authed ? 'green' : 'crimson' }}>
+            {authed ? 'Authenticated' : 'Not authenticated'}
+          </span>
+        ) : (
+          <span style={{ color: '#666' }}>Dev mode: writes allowed without token</span>
+        )}
       </div>
 
       {/* Filters */}
@@ -339,7 +361,7 @@ export default function Page() {
       {/* Create form */}
       <hr style={{ margin: '24px 0' }} />
       <h2>Add New App</h2>
-      {!authed && <p style={{ color:'#666' }}>Enter admin token above to add apps.</p>}
+      {!authed && <p style={{ color:'#666' }}>{requiresToken ? 'Enter a valid admin token to add apps.' : 'Dev mode: token not required.'}</p>}
       {authed && (
         <form onSubmit={handleCreate} style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 1fr 120px', gap: 8, alignItems: 'center' }}>
           <input placeholder="Name" value={fName} onChange={e => setFName(e.target.value)} />
