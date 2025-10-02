@@ -19,3 +19,12 @@
 2025-10-02 11:09:14,072 INFO GET /apps -> 200 in 7.7 ms
 2025-10-02 11:09:15,521 INFO GET /apps -> 200 in 15.3 ms
 2025-10-02 11:09:24,259 INFO GET /apps -> 200 in 6.5 ms
+2025-10-02 14:26:27,378 INFO GET /auth/mode -> 200 in 2.6 ms
+2025-10-02 14:26:27,383 INFO GET /auth/mode -> 200 in 1.5 ms
+2025-10-02 14:26:27,667 INFO GET /apps -> 200 in 4.8 ms
+2025-10-02 14:26:51,810 INFO GET /apps -> 200 in 1.9 ms
+2025-10-02 14:27:18,166 INFO GET /apps -> 200 in 4.3 ms
+2025-10-02 14:30:23,984 INFO GET /apps -> 200 in 5.3 ms
+2025-10-02 14:30:23,986 INFO GET /auth/mode -> 200 in 5.1 ms
+2025-10-02 14:30:23,988 INFO GET /apps -> 200 in 5.9 ms
+2025-10-02 14:30:23,989 INFO GET /auth/mode -> 200 in 0.6 ms
