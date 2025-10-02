@@ -1,21 +1,17 @@
 from typing import List, Optional
-from fastapi import FastAPI, Query, HTTPException, Path, Depends, Header
+from fastapi import FastAPI, Query, HTTPException, Path, Depends, Header, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, field_validator
 from sqlalchemy import create_engine, Column, Integer, String, Float
 from sqlalchemy.orm import declarative_base, Session
-import os
+import os, time, csv, io
 
 # --- Auth / Admin token ---
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 def require_admin(authorization: str = Header(default="")):
-    """
-    Expect header: Authorization: Bearer <ADMIN_TOKEN>
-    If ADMIN_TOKEN is unset, allow writes (developer convenience).
-    """
     if not ADMIN_TOKEN:
         return True  # dev mode (no token configured)
     parts = authorization.split()
@@ -24,7 +20,7 @@ def require_admin(authorization: str = Header(default="")):
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 # --- FastAPI app ---
-app = FastAPI(title="App Explorer API", version="0.7.1")
+app = FastAPI(title="App Explorer API", version="0.8.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],  # adjust in prod
@@ -33,17 +29,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Nicer 422 output (frontend shows field-specific errors)
+# Timing / access log (very lightweight)
+@app.middleware("http")
+async def timing_logger(request: Request, call_next):
+    t0 = time.perf_counter()
+    try:
+        response: Response = await call_next(request)
+        return response
+    finally:
+        dt_ms = (time.perf_counter() - t0) * 1000
+        path = request.url.path
+        method = request.method
+        status = getattr(response, "status_code", "?")
+        print(f"{method} {path} -> {status} in {dt_ms:.1f} ms")
+
+# Nicer 422 output
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
     return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
-# Public endpoint to tell the frontend whether a token is required
+# Auth helpers
 @app.get("/auth/mode")
 def auth_mode():
     return {"requires_token": bool(ADMIN_TOKEN)}
 
-# Protected endpoint to validate a bearer token
 @app.get("/auth/check", dependencies=[Depends(require_admin)])
 def auth_check():
     return {"ok": True}
@@ -90,7 +99,7 @@ class AppCreate(BaseModel):
     category: str
     rating: float
     installs: int
-    platform: str  # ios | android
+    platform: str
 
     @field_validator("name", "category")
     @classmethod
@@ -122,7 +131,6 @@ class AppCreate(BaseModel):
         return v2
 
 class AppUpdate(BaseModel):
-    # all fields optional for PATCH-like PUT
     name: Optional[str] = None
     category: Optional[str] = None
     rating: Optional[float] = None
@@ -179,6 +187,28 @@ def health():
 ALLOWED_SORT_FIELDS = {"rating", "installs", "name"}
 ALLOWED_DIRS = {"asc", "desc"}
 
+def apply_list_query(
+    s: Session,
+    q: Optional[str],
+    category: Optional[str],
+    platform: Optional[str],
+    min_rating: float,
+    sort_by: str,
+    sort_dir: str,
+):
+    query = s.query(AppRow)
+    if q:
+        query = query.filter(AppRow.name.ilike(f"%{q}%"))
+    if category:
+        query = query.filter(AppRow.category.ilike(category))
+    if platform:
+        query = query.filter(AppRow.platform == platform)
+    if min_rating:
+        query = query.filter(AppRow.rating >= min_rating)
+    order_col = {"rating": AppRow.rating, "installs": AppRow.installs, "name": AppRow.name}[sort_by]
+    query = query.order_by(order_col.desc() if sort_dir == "desc" else order_col.asc(), AppRow.id.asc())
+    return query
+
 @app.get("/apps", response_model=Page)
 def list_apps(
     q: Optional[str] = Query(None),
@@ -194,26 +224,35 @@ def list_apps(
         raise HTTPException(status_code=400, detail="Invalid sort_by or sort_dir")
 
     with Session(engine) as s:
-        query = s.query(AppRow)
-        if q:
-            query = query.filter(AppRow.name.ilike(f"%{q}%"))
-        if category:
-            query = query.filter(AppRow.category.ilike(category))
-        if platform:
-            query = query.filter(AppRow.platform == platform)
-        if min_rating:
-            query = query.filter(AppRow.rating >= min_rating)
-
+        query = apply_list_query(s, q, category, platform, min_rating, sort_by, sort_dir)
         total = query.count()
-
-        order_col = {"rating": AppRow.rating, "installs": AppRow.installs, "name": AppRow.name}[sort_by]
-        query = query.order_by(order_col.desc() if sort_dir == "desc" else order_col.asc(), AppRow.id.asc())
-
         rows = query.offset((page - 1) * page_size).limit(page_size).all()
-        items = [AppOut.model_validate(
-            {"id": r.id, "name": r.name, "category": r.category, "rating": r.rating, "installs": r.installs, "platform": r.platform}
-        ) for r in rows]
+        items = [AppOut.model_validate({"id": r.id, "name": r.name, "category": r.category,
+                                        "rating": r.rating, "installs": r.installs, "platform": r.platform}) for r in rows]
         return Page(items=items, total=total, page=page, page_size=page_size)
+
+@app.get("/apps/export.csv")
+def export_apps_csv(
+    q: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    platform: Optional[str] = Query(None, pattern="^(ios|android)$"),
+    min_rating: float = Query(0.0, ge=0.0, le=5.0),
+    sort_by: str = Query("rating"),
+    sort_dir: str = Query("desc"),
+):
+    """Exports the full filtered list (ignores pagination) as CSV."""
+    if sort_by not in ALLOWED_SORT_FIELDS or sort_dir not in ALLOWED_DIRS:
+        raise HTTPException(status_code=400, detail="Invalid sort_by or sort_dir")
+    with Session(engine) as s:
+        rows = apply_list_query(s, q, category, platform, min_rating, sort_by, sort_dir).all()
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["id","name","category","platform","rating","installs"])
+        for r in rows:
+            w.writerow([r.id, r.name, r.category, r.platform, r.rating, r.installs])
+        out = buf.getvalue()
+    headers = {"Content-Disposition": 'attachment; filename="apps_export.csv"'}
+    return PlainTextResponse(out, headers=headers, media_type="text/csv")
 
 @app.post("/apps", response_model=AppOut, status_code=201, dependencies=[Depends(require_admin)])
 def create_app(payload: AppCreate):
@@ -228,24 +267,18 @@ def create_app(payload: AppCreate):
         return AppOut(**row.__dict__)
 
 @app.put("/apps/{app_id}", response_model=AppOut, dependencies=[Depends(require_admin)])
-def update_app(
-    app_id: int = Path(..., ge=1),
-    payload: AppUpdate = ...,
-):
+def update_app(app_id: int = Path(..., ge=1), payload: AppUpdate = ...):
     with Session(engine) as s:
         row = s.get(AppRow, app_id)
         if not row:
             raise HTTPException(status_code=404, detail="App not found")
-
         data = payload.model_dump(exclude_none=True)
-        # duplicate protection on (name, platform) if both provided (or either changes)
         if ("name" in data or "platform" in data):
             new_name = data.get("name", row.name)
             new_plat = data.get("platform", row.platform)
             dup = s.query(AppRow).filter(AppRow.id != app_id, AppRow.name == new_name, AppRow.platform == new_plat).first()
             if dup:
                 raise HTTPException(status_code=409, detail="Another app with same name and platform exists")
-
         for k, v in data.items():
             setattr(row, k, v)
         s.commit()
