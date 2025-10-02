@@ -10,3 +10,9 @@ backend/.env
 # System
 .DS_Store
 Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+backend/.venv/
+

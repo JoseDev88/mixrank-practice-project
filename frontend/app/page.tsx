@@ -19,6 +19,7 @@ type PageDTO = {
 };
 
 export default function Page() {
+  // list state
   const [q, setQ] = useState('');
   const [category, setCategory] = useState('');
   const [platform, setPlatform] = useState('');
@@ -31,7 +32,14 @@ export default function Page() {
   const [err, setErr] = useState<string | null>(null);
   const pageSize = 5;
 
-  useEffect(() => {
+  // create form state
+  const [fName, setFName] = useState('');
+  const [fCategory, setFCategory] = useState('');
+  const [fRating, setFRating] = useState<number | ''>('');
+  const [fInstalls, setFInstalls] = useState<number | ''>('');
+  const [fPlatform, setFPlatform] = useState<'ios' | 'android' | ''>('');
+
+  function fetchPage() {
     const params = new URLSearchParams();
     if (q) params.set('q', q);
     if (category) params.set('category', category);
@@ -53,14 +61,62 @@ export default function Page() {
       .then(setData)
       .catch(e => setErr(e.message))
       .finally(() => setLoading(false));
-  }, [q, category, platform, minRating, sortBy, sortDir, page]);
+  }
+
+  useEffect(() => { fetchPage(); }, [q, category, platform, minRating, sortBy, sortDir, page]);
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    setErr(null);
+
+    // basic client validation mirrors the server rules
+    if (!fName.trim() || !fCategory.trim() || !fPlatform) {
+      setErr('Please fill name, category, and platform.');
+      return;
+    }
+    const ratingNum = Number(fRating);
+    const installsNum = Number(fInstalls);
+    if (Number.isNaN(ratingNum) || ratingNum < 0 || ratingNum > 5) {
+      setErr('Rating must be between 0 and 5.');
+      return;
+    }
+    if (!Number.isInteger(installsNum) || installsNum < 0) {
+      setErr('Installs must be a non-negative integer.');
+      return;
+    }
+
+    const resp = await fetch('http://127.0.0.1:8000/apps', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: fName.trim(),
+        category: fCategory.trim(),
+        rating: ratingNum,
+        installs: installsNum,
+        platform: fPlatform,
+      })
+    });
+
+    if (!resp.ok) {
+      const msg = await resp.text();
+      setErr(`Create failed: ${msg}`);
+      return;
+    }
+
+    // reset form
+    setFName(''); setFCategory(''); setFRating(''); setFInstalls(''); setFPlatform('');
+    // reload page 1 to show newest results more predictably
+    setPage(1);
+    fetchPage();
+  }
 
   const totalPages = data ? Math.ceil(data.total / data.page_size) : 1;
 
   return (
-    <main style={{ padding: 24, maxWidth: 1000, margin: '0 auto' }}>
+    <main style={{ padding: 24, maxWidth: 1100, margin: '0 auto' }}>
       <h1>App Explorer</h1>
 
+      {/* Filters */}
       <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr', gap: 12, marginBottom: 12 }}>
         <input placeholder="Search apps..." value={q} onChange={e => { setPage(1); setQ(e.target.value); }} />
         <input placeholder="Category (e.g., Finance)" value={category} onChange={e => { setPage(1); setCategory(e.target.value); }} />
@@ -72,17 +128,16 @@ export default function Page() {
         <input type="number" step="0.1" min={0} max={5} placeholder="Min rating" value={minRating} onChange={e => { setPage(1); setMinRating(Number(e.target.value || 0)); }} />
       </div>
 
+      {/* Sorting */}
       <div style={{ display: 'flex', gap: 12, alignItems: 'center', marginBottom: 12 }}>
-        <label>
-          Sort by:{' '}
+        <label>Sort by:{' '}
           <select value={sortBy} onChange={e => { setPage(1); setSortBy(e.target.value as any); }}>
             <option value="rating">Rating</option>
             <option value="installs">Installs</option>
             <option value="name">Name</option>
           </select>
         </label>
-        <label>
-          Direction:{' '}
+        <label>Direction:{' '}
           <select value={sortDir} onChange={e => { setPage(1); setSortDir(e.target.value as any); }}>
             <option value="desc">Desc</option>
             <option value="asc">Asc</option>
@@ -93,6 +148,7 @@ export default function Page() {
       {loading && <p>Loading…</p>}
       {err && <p style={{ color: 'crimson' }}>Error: {err}</p>}
 
+      {/* Table */}
       <table cellPadding={8} style={{ borderCollapse: 'collapse', width: '100%', opacity: loading ? 0.6 : 1 }}>
         <thead>
           <tr>
@@ -119,17 +175,28 @@ export default function Page() {
         </tbody>
       </table>
 
+      {/* Pagination */}
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 12 }}>
         <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={loading || page <= 1}>Prev</button>
         <span>Page {data?.page ?? page} / {totalPages}</span>
         <button onClick={() => setPage(p => (data ? Math.min(totalPages, p + 1) : p + 1))} disabled={loading || (data ? page >= totalPages : false)}>Next</button>
       </div>
 
-      {data && (
-        <p style={{ marginTop: 8, color: '#555' }}>
-          Showing {(data.page - 1) * data.page_size + 1}–{Math.min(data.page * data.page_size, data.total)} of {data.total}
-        </p>
-      )}
+      {/* Create form */}
+      <hr style={{ margin: '24px 0' }} />
+      <h2>Add New App</h2>
+      <form onSubmit={handleCreate} style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr 1fr 1fr 120px', gap: 8, alignItems: 'center' }}>
+        <input placeholder="Name" value={fName} onChange={e => setFName(e.target.value)} />
+        <input placeholder="Category" value={fCategory} onChange={e => setFCategory(e.target.value)} />
+        <select value={fPlatform} onChange={e => setFPlatform(e.target.value as any)}>
+          <option value="">Platform</option>
+          <option value="ios">iOS</option>
+          <option value="android">Android</option>
+        </select>
+        <input type="number" step="0.1" min={0} max={5} placeholder="Rating" value={fRating} onChange={e => setFRating((e.target.value === '') ? '' : Number(e.target.value))} />
+        <input type="number" step="1" min={0} placeholder="Installs" value={fInstalls} onChange={e => setFInstalls((e.target.value === '') ? '' : Number(e.target.value))} />
+        <button type="submit">Create</button>
+      </form>
     </main>
   );
 }
