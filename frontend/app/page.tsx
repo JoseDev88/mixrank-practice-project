@@ -32,12 +32,16 @@ export default function Page() {
   const [err, setErr] = useState<string | null>(null);
   const pageSize = 5;
 
-  // create form state
+  // create form
   const [fName, setFName] = useState('');
   const [fCategory, setFCategory] = useState('');
   const [fRating, setFRating] = useState<number | ''>('');
   const [fInstalls, setFInstalls] = useState<number | ''>('');
   const [fPlatform, setFPlatform] = useState<'ios' | 'android' | ''>('');
+
+  // edit state
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [edit, setEdit] = useState<Partial<AppItem>>({});
 
   function fetchPage() {
     const params = new URLSearchParams();
@@ -68,45 +72,61 @@ export default function Page() {
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     setErr(null);
-
-    // basic client validation mirrors the server rules
-    if (!fName.trim() || !fCategory.trim() || !fPlatform) {
-      setErr('Please fill name, category, and platform.');
-      return;
-    }
-    const ratingNum = Number(fRating);
-    const installsNum = Number(fInstalls);
-    if (Number.isNaN(ratingNum) || ratingNum < 0 || ratingNum > 5) {
-      setErr('Rating must be between 0 and 5.');
-      return;
-    }
-    if (!Number.isInteger(installsNum) || installsNum < 0) {
-      setErr('Installs must be a non-negative integer.');
-      return;
-    }
+    const ratingNum = Number(fRating), installsNum = Number(fInstalls);
+    if (!fName.trim() || !fCategory.trim() || !fPlatform) return setErr('Please fill name, category, and platform.');
+    if (Number.isNaN(ratingNum) || ratingNum < 0 || ratingNum > 5) return setErr('Rating must be 0–5.');
+    if (!Number.isInteger(installsNum) || installsNum < 0) return setErr('Installs must be a non‑negative integer.');
 
     const resp = await fetch('http://127.0.0.1:8000/apps', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: fName.trim(),
-        category: fCategory.trim(),
-        rating: ratingNum,
-        installs: installsNum,
-        platform: fPlatform,
-      })
+      body: JSON.stringify({ name: fName.trim(), category: fCategory.trim(), rating: ratingNum, installs: installsNum, platform: fPlatform }),
     });
+    if (!resp.ok) return setErr(`Create failed: ${await resp.text()}`);
 
-    if (!resp.ok) {
-      const msg = await resp.text();
-      setErr(`Create failed: ${msg}`);
-      return;
-    }
-
-    // reset form
     setFName(''); setFCategory(''); setFRating(''); setFInstalls(''); setFPlatform('');
-    // reload page 1 to show newest results more predictably
     setPage(1);
+    fetchPage();
+  }
+
+  function startEdit(row: AppItem) {
+    setEditingId(row.id);
+    setEdit({ ...row });
+  }
+  function cancelEdit() {
+    setEditingId(null);
+    setEdit({});
+  }
+  async function saveEdit(id: number) {
+    const payload: any = {};
+    ['name','category','platform','rating','installs'].forEach(k => {
+      if ((edit as any)[k] !== undefined) payload[k] = (edit as any)[k];
+    });
+    // client checks similar to server
+    if (payload.name !== undefined && !String(payload.name).trim()) return setErr('Name must not be empty.');
+    if (payload.category !== undefined && !String(payload.category).trim()) return setErr('Category must not be empty.');
+    if (payload.platform !== undefined && !['ios','android'].includes(payload.platform)) return setErr('Platform must be ios or android.');
+    if (payload.rating !== undefined && (payload.rating < 0 || payload.rating > 5)) return setErr('Rating must be 0–5.');
+    if (payload.installs !== undefined && (!Number.isInteger(payload.installs) || payload.installs < 0)) return setErr('Installs must be a non‑negative integer.');
+
+    const resp = await fetch(`http://127.0.0.1:8000/apps/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!resp.ok) return setErr(`Update failed: ${await resp.text()}`);
+    setEditingId(null);
+    setEdit({});
+    fetchPage();
+  }
+  async function deleteRow(id: number) {
+    const ok = confirm('Delete this app?');
+    if (!ok) return;
+    const resp = await fetch(`http://127.0.0.1:8000/apps/${id}`, { method: 'DELETE' });
+    if (!resp.ok && resp.status !== 204) return setErr(`Delete failed: ${await resp.text()}`);
+    // If we deleted the last item on the page, go back a page if needed
+    const newPage = (data && data.items.length === 1 && page > 1) ? page - 1 : page;
+    setPage(newPage);
     fetchPage();
   }
 
@@ -157,20 +177,64 @@ export default function Page() {
             <th align="left">Platform</th>
             <th align="right">Rating</th>
             <th align="right">Installs</th>
+            <th align="left">Actions</th>
           </tr>
         </thead>
         <tbody>
-          {data?.items?.map(app => (
-            <tr key={app.id} style={{ borderTop: '1px solid #ddd' }}>
-              <td>{app.name}</td>
-              <td>{app.category}</td>
-              <td>{app.platform}</td>
-              <td align="right">{app.rating}</td>
-              <td align="right">{app.installs.toLocaleString()}</td>
-            </tr>
-          ))}
+          {data?.items?.map(row => {
+            const isEditing = editingId === row.id;
+            return (
+              <tr key={row.id} style={{ borderTop: '1px solid #ddd' }}>
+                <td>
+                  {isEditing ? (
+                    <input value={String(edit.name ?? row.name)} onChange={e => setEdit(p => ({ ...p, name: e.target.value }))} />
+                  ) : row.name}
+                </td>
+                <td>
+                  {isEditing ? (
+                    <input value={String(edit.category ?? row.category)} onChange={e => setEdit(p => ({ ...p, category: e.target.value }))} />
+                  ) : row.category}
+                </td>
+                <td>
+                  {isEditing ? (
+                    <select value={String(edit.platform ?? row.platform)} onChange={e => setEdit(p => ({ ...p, platform: e.target.value as any }))}>
+                      <option value="ios">iOS</option>
+                      <option value="android">Android</option>
+                    </select>
+                  ) : row.platform}
+                </td>
+                <td align="right">
+                  {isEditing ? (
+                    <input type="number" step="0.1" min={0} max={5}
+                      value={String(edit.rating ?? row.rating)}
+                      onChange={e => setEdit(p => ({ ...p, rating: Number(e.target.value) }))} />
+                  ) : row.rating}
+                </td>
+                <td align="right">
+                  {isEditing ? (
+                    <input type="number" step="1" min={0}
+                      value={String(edit.installs ?? row.installs)}
+                      onChange={e => setEdit(p => ({ ...p, installs: Number(e.target.value) }))} />
+                  ) : row.installs.toLocaleString()}
+                </td>
+                <td>
+                  {!isEditing ? (
+                    <>
+                      <button onClick={() => startEdit(row)}>Edit</button>{' '}
+                      <button onClick={() => deleteRow(row.id)}>Delete</button>
+                    </>
+                  ) : (
+                    <>
+                      <button onClick={() => saveEdit(row.id)}>Save</button>{' '}
+                      <button onClick={cancelEdit}>Cancel</button>
+                    </>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
           {!loading && data?.items?.length === 0 && (
-            <tr><td colSpan={5} style={{ color: '#666' }}>No results.</td></tr>
+            <tr><td colSpan={6} style={{ color: '#666' }}>No results.</td></tr>
           )}
         </tbody>
       </table>
@@ -178,8 +242,9 @@ export default function Page() {
       {/* Pagination */}
       <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 12 }}>
         <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={loading || page <= 1}>Prev</button>
-        <span>Page {data?.page ?? page} / {totalPages}</span>
-        <button onClick={() => setPage(p => (data ? Math.min(totalPages, p + 1) : p + 1))} disabled={loading || (data ? page >= totalPages : false)}>Next</button>
+        <span>Page {data?.page ?? page} / {data ? Math.ceil(data.total / data.page_size) : 1}</span>
+        <button onClick={() => setPage(p => (data ? Math.min(Math.ceil(data.total / data.page_size), p + 1) : p + 1))}
+                disabled={loading || (data ? page >= Math.ceil(data.total / data.page_size) : false)}>Next</button>
       </div>
 
       {/* Create form */}
