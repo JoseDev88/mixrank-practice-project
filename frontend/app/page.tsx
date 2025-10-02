@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 type AppItem = {
   id: number;
@@ -17,6 +17,24 @@ type PageDTO = {
   page: number;
   page_size: number;
 };
+
+// Read API base from env, fallback to local dev
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://127.0.0.1:8000';
+
+// Helper to extract a useful error message from FastAPI responses
+async function extractError(res: Response) {
+  let msg = await res.text();
+  try {
+    const j = JSON.parse(msg);
+    if (j?.detail) {
+      if (typeof j.detail === 'string') return j.detail;
+      return JSON.stringify(j.detail);
+    }
+  } catch {
+    /* ignore JSON parse errors */
+  }
+  return msg || res.statusText;
+}
 
 export default function Page() {
   // list state
@@ -58,7 +76,8 @@ export default function Page() {
     }
   }, [token]);
 
-  function fetchPage() {
+  // Build URL params from current state
+  const queryString = useMemo(() => {
     const params = new URLSearchParams();
     if (q) params.set('q', q);
     if (category) params.set('category', category);
@@ -68,21 +87,38 @@ export default function Page() {
     params.set('sort_dir', sortDir);
     params.set('page', String(page));
     params.set('page_size', String(pageSize));
+    return params.toString();
+  }, [q, category, platform, minRating, sortBy, sortDir, page]);
 
+  // Debounced fetch: wait 300ms after last change; cancel in-flight requests
+  const abortRef = useRef<AbortController | null>(null);
+  useEffect(() => {
     setLoading(true);
     setErr(null);
 
-    fetch(`http://127.0.0.1:8000/apps?${params.toString()}`)
-      .then(res => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json();
-      })
-      .then(setData)
-      .catch(e => setErr(e.message))
-      .finally(() => setLoading(false));
-  }
+    // abort previous request (if any)
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
 
-  useEffect(() => { fetchPage(); }, [q, category, platform, minRating, sortBy, sortDir, page]);
+    const tid = setTimeout(() => {
+      fetch(`${API_BASE}/apps?${queryString}`, { signal: controller.signal })
+        .then(async (res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}: ${await extractError(res)}`);
+          return res.json();
+        })
+        .then(setData)
+        .catch((e: any) => {
+          if (e.name !== 'AbortError') setErr(e.message || String(e));
+        })
+        .finally(() => setLoading(false));
+    }, 300);
+
+    return () => {
+      controller.abort();
+      clearTimeout(tid);
+    };
+  }, [queryString]);
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -90,9 +126,9 @@ export default function Page() {
     const ratingNum = Number(fRating), installsNum = Number(fInstalls);
     if (!fName.trim() || !fCategory.trim() || !fPlatform) return setErr('Please fill name, category, and platform.');
     if (Number.isNaN(ratingNum) || ratingNum < 0 || ratingNum > 5) return setErr('Rating must be 0–5.');
-    if (!Number.isInteger(installsNum) || installsNum < 0) return setErr('Installs must be a non‑negative integer.');
+    if (!Number.isInteger(installsNum) || installsNum < 0) return setErr('Installs must be a non-negative integer.');
 
-    const resp = await fetch('http://127.0.0.1:8000/apps', {
+    const resp = await fetch(`${API_BASE}/apps`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -100,11 +136,16 @@ export default function Page() {
       },
       body: JSON.stringify({ name: fName.trim(), category: fCategory.trim(), rating: ratingNum, installs: installsNum, platform: fPlatform }),
     });
-    if (!resp.ok) return setErr(`Create failed: ${await resp.text()}`);
+    if (!resp.ok) {
+      const msg = await extractError(resp);
+      setErr(`Request failed (${resp.status}): ${msg}`);
+      return;
+    }
 
     setFName(''); setFCategory(''); setFRating(''); setFInstalls(''); setFPlatform('');
     setPage(1);
-    fetchPage();
+    // force refresh (keeps debounce but re-runs immediately by tweaking state)
+    setErr(null);
   }
 
   function startEdit(row: AppItem) {
@@ -124,9 +165,9 @@ export default function Page() {
     if (payload.category !== undefined && !String(payload.category).trim()) return setErr('Category must not be empty.');
     if (payload.platform !== undefined && !['ios','android'].includes(payload.platform)) return setErr('Platform must be ios or android.');
     if (payload.rating !== undefined && (payload.rating < 0 || payload.rating > 5)) return setErr('Rating must be 0–5.');
-    if (payload.installs !== undefined && (!Number.isInteger(payload.installs) || payload.installs < 0)) return setErr('Installs must be a non‑negative integer.');
+    if (payload.installs !== undefined && (!Number.isInteger(payload.installs) || payload.installs < 0)) return setErr('Installs must be a non-negative integer.');
 
-    const resp = await fetch(`http://127.0.0.1:8000/apps/${id}`, {
+    const resp = await fetch(`${API_BASE}/apps/${id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -134,22 +175,31 @@ export default function Page() {
       },
       body: JSON.stringify(payload),
     });
-    if (!resp.ok) return setErr(`Update failed: ${await resp.text()}`);
+    if (!resp.ok) {
+      const msg = await extractError(resp);
+      setErr(`Request failed (${resp.status}): ${msg}`);
+      return;
+    }
     setEditingId(null);
     setEdit({});
-    fetchPage();
+    setErr(null);
   }
+
   async function deleteRow(id: number) {
     const ok = confirm('Delete this app?');
     if (!ok) return;
-    const resp = await fetch(`http://127.0.0.1:8000/apps/${id}`, {
+    const resp = await fetch(`${API_BASE}/apps/${id}`, {
       method: 'DELETE',
       headers: { ...(authed ? { Authorization: `Bearer ${token}` } : {}) },
     });
-    if (!resp.ok && resp.status !== 204) return setErr(`Delete failed: ${await resp.text()}`);
+    if (!resp.ok && resp.status !== 204) {
+      const msg = await extractError(resp);
+      setErr(`Request failed (${resp.status}): ${msg}`);
+      return;
+    }
     const newPage = (data && data.items.length === 1 && page > 1) ? page - 1 : page;
     setPage(newPage);
-    fetchPage();
+    setErr(null);
   }
 
   const totalPages = data ? Math.ceil(data.total / data.page_size) : 1;
@@ -168,7 +218,7 @@ export default function Page() {
           style={{ width: 220 }}
         />
         <button onClick={() => setToken('')}>Logout</button>
-        {!authed && <span style={{ color: '#666' }}>Read‑only mode. Enter token to enable editing.</span>}
+        {!authed && <span style={{ color: '#666' }}>Read-only mode. Enter token to enable editing.</span>}
       </div>
 
       {/* Filters */}
@@ -201,7 +251,7 @@ export default function Page() {
       </div>
 
       {loading && <p>Loading…</p>}
-      {err && <p style={{ color: 'crimson' }}>Error: {err}</p>}
+      {err && <p style={{ color: 'crimson', whiteSpace: 'pre-wrap' }}>Error: {err}</p>}
 
       {/* Table */}
       <table cellPadding={8} style={{ borderCollapse: 'collapse', width: '100%', opacity: loading ? 0.6 : 1 }}>

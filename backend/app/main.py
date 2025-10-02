@@ -1,13 +1,14 @@
 from typing import List, Optional
 from fastapi import FastAPI, Query, HTTPException, Path, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 from sqlalchemy import create_engine, Column, Integer, String, Float
 from sqlalchemy.orm import declarative_base, Session
 import os
 
 # --- Auth / Admin token ---
-# Set ADMIN_TOKEN in your environment; when empty, writes are allowed (dev mode).
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 def require_admin(authorization: str = Header(default="")):
@@ -23,14 +24,19 @@ def require_admin(authorization: str = Header(default="")):
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 # --- FastAPI app ---
-app = FastAPI(title="App Explorer API", version="0.6.0")
+app = FastAPI(title="App Explorer API", version="0.7.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000"],  # adjust if you deploy frontend elsewhere
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Nicer 422 output (frontend shows field-specific errors)
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc):
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 # --- SQLite + SQLAlchemy setup ---
 DB_URL = "sqlite:///./app_explorer.db"
